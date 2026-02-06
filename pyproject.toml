@@ -1,0 +1,10 @@
+[project]
+name = "pantheon-traffic-forensics"
+version = "0.1.0"
+description = "Traffic spike triage helpers for Pantheon access logs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+ptf = "ptf.cli:main"
