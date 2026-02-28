@@ -5,12 +5,29 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable
 
-COMBINED_LOG_RE = re.compile(
+# Nginx combined log regex
+NGINX_LOG_RE = re.compile(
     r"^(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)] "
     r'"(?P<method>\S+) (?P<path>\S+) (?P<proto>[^"]+)" '
     r"(?P<status>\d{3}) (?P<size>\S+) "
     r'"(?P<referer>[^"]*)" "(?P<agent>[^"]*)"'
 )
+
+# Apache combined log regex -- handles the same field order but
+# is more lenient with the byte-count field (accepts "-") and
+# allows optional trailing fields that some Apache configs add.
+APACHE_LOG_RE = re.compile(
+    r"^(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)] "
+    r'"(?P<method>\S+) (?P<path>\S+)'
+    r"(?: (?P<proto>[^\"]*))?"
+    r'" (?P<status>\d{3}) (?P<size>\S+)'
+    r'(?: "(?P<referer>[^"]*)" "(?P<agent>[^"]*)")?'
+)
+
+LOG_FORMATS: dict[str, re.Pattern[str]] = {
+    "nginx": NGINX_LOG_RE,
+    "apache": APACHE_LOG_RE,
+}
 
 SUSPICIOUS_AGENTS = (
     "bot",
@@ -56,18 +73,34 @@ def normalize_path(raw_path: str) -> str:
     return raw_path.split("?", 1)[0]
 
 
-def parse_line(line: str) -> LogEvent | None:
-    match = COMBINED_LOG_RE.match(line.strip())
+def parse_line(
+    line: str,
+    fmt: str = "nginx",
+) -> LogEvent | None:
+    """Parse a single log line.
+
+    *fmt* selects the regex: ``"nginx"`` (default) or
+    ``"apache"``.
+    """
+    pattern = LOG_FORMATS.get(fmt)
+    if pattern is None:
+        raise ValueError(
+            f"Unknown log format {fmt!r}. "
+            f"Choose from: {', '.join(LOG_FORMATS)}"
+        )
+
+    match = pattern.match(line.strip())
     if not match:
         return None
 
     path = normalize_path(match.group("path"))
+    agent = match.group("agent") or ""
     return LogEvent(
         ip=match.group("ip"),
         method=match.group("method"),
         path=path,
         status=int(match.group("status")),
-        agent=match.group("agent"),
+        agent=agent,
     )
 
 
@@ -77,12 +110,23 @@ def classify_suspicious(event: LogEvent) -> str | None:
         return "empty-user-agent"
     if any(token in agent_lower for token in SUSPICIOUS_AGENTS):
         return "bot-like-user-agent"
-    if any(hint in event.path.lower() for hint in SUSPICIOUS_PATH_HINTS):
+    if any(
+        hint in event.path.lower()
+        for hint in SUSPICIOUS_PATH_HINTS
+    ):
         return "suspicious-path"
     return None
 
 
-def summarize(lines: Iterable[str], top: int = 10) -> TrafficSummary:
+def summarize(
+    lines: Iterable[str],
+    top: int = 10,
+    fmt: str = "nginx",
+) -> TrafficSummary:
+    """Summarize parsed log events.
+
+    *fmt* is forwarded to :func:`parse_line`.
+    """
     path_counter: Counter[str] = Counter()
     ip_counter: Counter[str] = Counter()
     agent_counter: Counter[str] = Counter()
@@ -91,7 +135,7 @@ def summarize(lines: Iterable[str], top: int = 10) -> TrafficSummary:
     total = 0
 
     for line in lines:
-        event = parse_line(line)
+        event = parse_line(line, fmt=fmt)
         if not event:
             continue
         total += 1
@@ -101,7 +145,9 @@ def summarize(lines: Iterable[str], top: int = 10) -> TrafficSummary:
         status_counter[event.status] += 1
         reason = classify_suspicious(event)
         if reason:
-            suspicious_hits.append((reason, event.path, event.agent or "(empty)"))
+            suspicious_hits.append(
+                (reason, event.path, event.agent or "(empty)")
+            )
 
     return TrafficSummary(
         total=total,
